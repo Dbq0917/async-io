@@ -49,6 +49,75 @@ const TIMER_QUEUE_SIZE: usize = 100;
 const READ: usize = 0;
 const WRITE: usize = 1;
 
+/// Number of low bits in an event key used to index the source table.
+///
+/// The remaining high bits hold a generation counter that distinguishes successive sources
+/// registered into the same slot.
+const SLOT_BITS: u32 = usize::BITS / 2;
+
+/// Mask extracting the slot index from an event key.
+const SLOT_MASK: usize = (1 << SLOT_BITS) - 1;
+
+/// Largest value the generation counter in an event key can take.
+const MAX_GENERATION: usize = usize::MAX >> SLOT_BITS;
+
+/// Table of registered I/O sources.
+#[derive(Debug, Default)]
+struct SourceTable {
+    /// Live sources, indexed by slot.
+    slab: Slab<Arc<Source>>,
+
+    /// Per-slot generation counters.
+    ///
+    /// A slot's generation is bumped every time a new source is registered into it. The
+    /// kernel may still report events that were queued before the previous source occupying
+    /// the slot was deregistered; tagging event keys with the generation keeps those stale
+    /// events from being delivered to the new source.
+    generations: Vec<usize>,
+}
+
+impl SourceTable {
+    /// Creates an empty source table.
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Inserts a new source into the table.
+    fn insert(&mut self, registration: Registration) -> io::Result<Arc<Source>> {
+        let entry = self.slab.vacant_entry();
+        let slot = entry.key();
+
+        if slot > SLOT_MASK {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "too many I/O sources registered in the reactor",
+            ));
+        }
+
+        // Bump the slot's generation so that events queued for the previous occupant of
+        // this slot can't be delivered to the new source.
+        let generation = self
+            .generations
+            .get(slot)
+            .copied()
+            .unwrap_or(0)
+            .wrapping_add(1)
+            & MAX_GENERATION;
+        if self.generations.len() <= slot {
+            self.generations.resize(slot + 1, 0);
+        }
+        self.generations[slot] = generation;
+
+        let source = Arc::new(Source {
+            registration,
+            key: (generation << SLOT_BITS) | slot,
+            state: Default::default(),
+        });
+        entry.insert(source.clone());
+        Ok(source)
+    }
+}
+
 /// The reactor.
 ///
 /// There is only one global instance of this type, accessible by [`Reactor::get()`].
@@ -67,7 +136,7 @@ pub(crate) struct Reactor {
     ticker: AtomicUsize,
 
     /// Registered sources.
-    sources: Mutex<Slab<Arc<Source>>>,
+    sources: Mutex<SourceTable>,
 
     /// Temporary storage for I/O events when polling the reactor.
     ///
@@ -98,7 +167,7 @@ impl Reactor {
             Reactor {
                 poller: Poller::new().expect("cannot initialize I/O event notification"),
                 ticker: AtomicUsize::new(0),
-                sources: Mutex::new(Slab::new()),
+                sources: Mutex::new(SourceTable::new()),
                 events: Mutex::new(Events::new()),
                 timers: Mutex::new(BTreeMap::new()),
                 timer_ops: ConcurrentQueue::bounded(TIMER_QUEUE_SIZE),
@@ -116,20 +185,13 @@ impl Reactor {
         // Create an I/O source for this file descriptor.
         let source = {
             let mut sources = self.sources.lock().unwrap();
-            let key = sources.vacant_entry().key();
-            let source = Arc::new(Source {
-                registration: raw,
-                key,
-                state: Default::default(),
-            });
-            sources.insert(source.clone());
-            source
+            sources.insert(raw)?
         };
 
         // Register the file descriptor.
         if let Err(err) = source.registration.add(&self.poller, source.key) {
             let mut sources = self.sources.lock().unwrap();
-            sources.remove(source.key);
+            sources.slab.remove(source.slot());
             return Err(err);
         }
 
@@ -139,7 +201,7 @@ impl Reactor {
     /// Deregisters an I/O source from the reactor.
     pub(crate) fn remove_io(&self, source: &Source) -> io::Result<()> {
         let mut sources = self.sources.lock().unwrap();
-        sources.remove(source.key);
+        sources.slab.remove(source.slot());
         source.registration.delete(&self.poller)
     }
 
@@ -316,7 +378,14 @@ impl ReactorLock<'_> {
 
                 for ev in self.events.iter() {
                     // Check if there is a source in the table with this key.
-                    if let Some(source) = sources.get(ev.key) {
+                    if let Some(source) = sources.slab.get(ev.key & SLOT_MASK) {
+                        // Ignore stale events that were queued for a source that has
+                        // since been deregistered. The slot may have been recycled by a
+                        // new source, so compare the full key, generation included.
+                        if source.key != ev.key {
+                            continue;
+                        }
+
                         let mut state = source.state.lock().unwrap();
 
                         // Collect wakers if any event was emitted.
@@ -379,11 +448,20 @@ pub(crate) struct Source {
     /// This source's registration into the reactor.
     registration: Registration,
 
-    /// The key of this source obtained during registration.
+    /// The event key of this source obtained during registration.
+    ///
+    /// Combines the slot index in the source table with a generation counter.
     key: usize,
 
     /// Inner state with registered wakers.
     state: Mutex<[Direction; 2]>,
+}
+
+impl Source {
+    /// The slot this source occupies in the source table.
+    fn slot(&self) -> usize {
+        self.key & SLOT_MASK
+    }
 }
 
 /// A read or write direction.
@@ -676,5 +754,38 @@ impl<H: Borrow<crate::Async<T>>, T> Drop for Ready<H, T> {
                 wakers.remove(key);
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::io::AsFd;
+
+    #[test]
+    fn recycled_slot_gets_fresh_key() {
+        let reactor = Reactor::get();
+
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let source1 = reactor
+            .insert_io(unsafe { Registration::new(a.as_fd()) })
+            .unwrap();
+        let slot = source1.slot();
+
+        // Deregister the source, freeing its slot. Events queued by the kernel for this
+        // source may still be in flight at this point.
+        reactor.remove_io(&source1).unwrap();
+
+        let (c, _d) = std::os::unix::net::UnixStream::pair().unwrap();
+        let source2 = reactor
+            .insert_io(unsafe { Registration::new(c.as_fd()) })
+            .unwrap();
+
+        // The slot is recycled, but the event key must differ so that stale events
+        // queued for the deregistered source can't be delivered to the new one.
+        assert_eq!(source2.slot(), slot);
+        assert_ne!(source2.key, source1.key);
+
+        reactor.remove_io(&source2).unwrap();
     }
 }
