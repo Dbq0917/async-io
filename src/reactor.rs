@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::task::{ready, Context, Poll, Waker};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use concurrent_queue::ConcurrentQueue;
@@ -137,10 +138,100 @@ impl Reactor {
     }
 
     /// Deregisters an I/O source from the reactor.
+    ///
+    /// This is the single teardown entry point, used both when the caller moves the inner handle
+    /// out ([`Async::into_inner`]) and when an [`Async`] is dropped. It first tears down the
+    /// kernel-side registration (cancelling any in-flight readiness operation on backends such
+    /// as IOCP), then wakes and releases every task still waiting on the source, and only then
+    /// removes the source bookkeeping. Transient deregistration failures are retried a bounded
+    /// number of times so closing stays responsive; real failures are returned to the caller
+    /// instead of being swallowed.
     pub(crate) fn remove_io(&self, source: &Source) -> io::Result<()> {
         let mut sources = self.sources.lock().unwrap();
+        self.remove_io_locked(&mut sources, source)
+    }
+
+    /// Implementation of [`remove_io`](Reactor::remove_io).
+    ///
+    /// The caller must hold the `sources` lock.
+    fn remove_io_locked(
+        &self,
+        sources: &mut MutexGuard<'_, Slab<Arc<Source>>>,
+        source: &Source,
+    ) -> io::Result<()> {
+        // Deregister from the poller first. On backends such as IOCP this is the step that
+        // cancels in-flight readiness operations; doing it before the slab entry is removed means
+        // a failed deregistration leaves the bookkeeping and the kernel registration in sync
+        // instead of half-done.
+        let result = self.deregister_with_timeout(source);
+
+        // End in-flight operations explicitly: wake and release every task still interested in
+        // this source. The handle is going away (or has been moved out), so pending reads and
+        // writes must not keep waiting on it regardless of whether deregistration succeeded.
+        let wakers = {
+            let mut state = source.state.lock().unwrap();
+            let mut wakers = Vec::new();
+            state[READ].drain_into(&mut wakers);
+            state[WRITE].drain_into(&mut wakers);
+            wakers
+        };
+        for waker in wakers {
+            // Don't let a panicking waker blow everything up.
+            panic::catch_unwind(|| waker.wake()).ok();
+        }
+
+        // Remove the slab entry only after the kernel-side registration has been dealt with.
+        // If deregistration failed, keep the entry (and the `Arc<Source>` inside it) alive, so the
+        // descriptor cannot be reused against a stale registration and the error is not hidden;
+        // the waiting tasks have still been released above.
+        #[allow(clippy::question_mark)]
+        if result.is_err() {
+            return result;
+        }
         sources.remove(source.key);
-        source.registration.delete(&self.poller)
+
+        result
+    }
+
+    /// Deregisters a source from the poller, retrying transient failures a bounded number of
+    /// times.
+    ///
+    /// Deregistration is normally a quick syscall, but it can be interrupted by a signal
+    /// (`EINTR`) or race with an in-flight readiness operation. Such cases are retried with a
+    /// short backoff so that closing stays responsive; persistent errors are returned to the
+    /// caller instead of being hidden.
+    fn deregister_with_timeout(&self, source: &Source) -> io::Result<()> {
+        const MAX_ATTEMPTS: u32 = 5;
+        const RETRY_DELAY: Duration = Duration::from_micros(100);
+
+        let mut attempt = 0;
+        loop {
+            match source.registration.delete(&self.poller) {
+                Ok(()) => return Ok(()),
+                // The descriptor is no longer registered (e.g. it was already removed, or the
+                // kernel dropped the registration when it was closed). There is nothing to wait
+                // for and nothing to leak, so treat it as a successful deregistration.
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    #[cfg(feature = "tracing")]
+                    tracing::trace!(
+                        ?err,
+                        key = source.key,
+                        "I/O source was already deregistered, treating as success"
+                    );
+                    return Ok(());
+                }
+                // Retry interruptions and temporary failures, but never without a bound.
+                Err(err)
+                    if (err.kind() == io::ErrorKind::Interrupted
+                        || err.kind() == io::ErrorKind::WouldBlock)
+                        && attempt + 1 < MAX_ATTEMPTS =>
+                {
+                    attempt += 1;
+                    thread::sleep(RETRY_DELAY);
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     /// Registers a timer in the reactor.

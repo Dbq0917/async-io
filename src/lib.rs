@@ -878,6 +878,8 @@ impl<T> Async<T> {
     /// ```
     pub fn into_inner(mut self) -> io::Result<T> {
         let io = self.io.take().unwrap();
+        // Deregister and surface any real failure: the caller still owns the handle and must be
+        // able to tell that the reactor did not finish cleaning it up.
         Reactor::get().remove_io(&self.source)?;
         Ok(io)
     }
@@ -1159,8 +1161,33 @@ impl<T> AsRef<T> for Async<T> {
 impl<T> Drop for Async<T> {
     fn drop(&mut self) {
         if self.io.is_some() {
-            // Deregister and ignore errors because destructors should not panic.
-            Reactor::get().remove_io(&self.source).ok();
+            // Orderly teardown: cancel in-flight readiness operations, wake any tasks waiting on
+            // this source, deregister from the poller and only then close the handle.
+            //
+            // Destructors must not panic, so errors cannot be propagated; they must not be
+            // swallowed silently either, otherwise the upper layers believe the close succeeded
+            // while a kernel-side registration (and thus a descriptor/handle) may still be held.
+            // `remove_io` retries transient failures a bounded number of times, so this stays
+            // fast; a persistent failure is reported and the reactor keeps the source
+            // bookkeeping alive rather than pretending the close was clean.
+            if let Err(err) = Reactor::get().remove_io(&self.source) {
+                #[cfg(feature = "tracing")]
+                tracing::error!(
+                    ?err,
+                    "failed to deregister I/O source while closing; \
+                     reactor bookkeeping is retained to avoid a stale registration"
+                );
+                #[cfg(not(feature = "tracing"))]
+                {
+                    // Make the failure observable even without the `tracing` feature enabled.
+                    // A panic in drop is not acceptable, so report it on the standard error
+                    // channel instead of silently dropping the error.
+                    eprintln!(
+                        "async-io: failed to deregister I/O source while closing: {err}; \
+                         reactor bookkeeping is retained to avoid a stale registration"
+                    );
+                }
+            }
 
             // Drop the I/O handle to close it.
             self.io.take();
