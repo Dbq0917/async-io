@@ -571,6 +571,11 @@ impl Stream for Timer {
 /// try to do that, conflicting tasks will just keep waking each other in turn, thus wasting CPU
 /// time.
 ///
+/// When both directions become ready in the same reactor turn, readable wakers are notified
+/// before writable wakers for that source. This orders the read and write notification
+/// boundaries; it does not serialize the operations, which can still make progress concurrently
+/// once their tasks are notified.
+///
 /// Besides [`AsyncRead`] and [`AsyncWrite`], this caveat also applies to
 /// [`poll_readable()`][`Async::poll_readable()`] and
 /// [`poll_writable()`][`Async::poll_writable()`].

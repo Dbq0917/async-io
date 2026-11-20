@@ -338,6 +338,77 @@ fn tcp_duplex() -> io::Result<()> {
 }
 
 #[test]
+fn tcp_duplex_length_framed() -> io::Result<()> {
+    const FRAMES: usize = 256;
+    const PAYLOAD_LEN: usize = 127;
+
+    async fn write_frames(mut stream: &Async<TcpStream>, tag: u8) -> io::Result<()> {
+        let mut frame = [0u8; 4 + PAYLOAD_LEN];
+        frame[..4].copy_from_slice(&(PAYLOAD_LEN as u32).to_le_bytes());
+
+        for seq in 0..FRAMES {
+            for (offset, byte) in frame[4..].iter_mut().enumerate() {
+                *byte = tag.wrapping_add(seq as u8).wrapping_add(offset as u8);
+            }
+            stream.write_all(&frame).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn read_frames(mut stream: &Async<TcpStream>, tag: u8) -> io::Result<()> {
+        let mut header = [0u8; 4];
+        let mut payload = [0u8; PAYLOAD_LEN];
+
+        for seq in 0..FRAMES {
+            stream.read_exact(&mut header).await?;
+            let len = u32::from_le_bytes(header) as usize;
+            if len != PAYLOAD_LEN {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("frame {seq} has unexpected length {len}"),
+                ));
+            }
+
+            stream.read_exact(&mut payload).await?;
+            for (offset, byte) in payload.iter().enumerate() {
+                let expected = tag.wrapping_add(seq as u8).wrapping_add(offset as u8);
+                if *byte != expected {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("frame {seq} is misaligned at byte {offset}"),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn duplex(stream: &Async<TcpStream>, send_tag: u8, recv_tag: u8) -> io::Result<()> {
+        future::try_zip(
+            write_frames(stream, send_tag),
+            read_frames(stream, recv_tag),
+        )
+        .await?;
+        Ok(())
+    }
+
+    future::block_on(async {
+        let listener = Async::<TcpListener>::bind(([127, 0, 0, 1], 0))?;
+        let addr = listener.get_ref().local_addr()?;
+        let task = spawn(async move { listener.accept().await });
+        let client = Async::<TcpStream>::connect(addr);
+
+        let client = client.await?;
+        let (server, _) = task.await?;
+
+        future::try_zip(duplex(&client, 0x20, 0x80), duplex(&server, 0x80, 0x20)).await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn shutdown() -> io::Result<()> {
     future::block_on(async {
         let listener = Async::<TcpListener>::bind(([127, 0, 0, 1], 0))?;

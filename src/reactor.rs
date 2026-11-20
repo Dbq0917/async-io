@@ -320,7 +320,13 @@ impl ReactorLock<'_> {
                         let mut state = source.state.lock().unwrap();
 
                         // Collect wakers if any event was emitted.
-                        for &(dir, emitted) in &[(WRITE, ev.writable), (READ, ev.readable)] {
+                        //
+                        // Read readiness is delivered before write readiness for a given
+                        // source. This keeps a write from being dispatched in the middle of a
+                        // read batch when both directions become ready in the same reactor
+                        // tick, while still allowing reads and writes to proceed concurrently
+                        // after they have been woken.
+                        for &(dir, emitted) in &[(READ, ev.readable), (WRITE, ev.writable)] {
                             if emitted {
                                 state[dir].tick = tick;
                                 state[dir].drain_into(&mut wakers);
@@ -676,5 +682,74 @@ impl<H: Borrow<crate::Async<T>>, T> Drop for Ready<H, T> {
                 wakers.remove(key);
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::io::AsFd;
+    use std::sync::Mutex;
+    use std::task::Wake;
+
+    #[derive(Debug)]
+    struct RecordingWaker {
+        name: &'static str,
+        order: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Wake for RecordingWaker {
+        fn wake(self: Arc<Self>) {
+            self.order.lock().unwrap().push(self.name);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.order.lock().unwrap().push(self.name);
+        }
+    }
+
+    fn recording_waker(name: &'static str, order: Arc<Mutex<Vec<&'static str>>>) -> Waker {
+        Waker::from(Arc::new(RecordingWaker { name, order }))
+    }
+
+    #[test]
+    fn reads_are_dispatched_before_writes_for_the_same_source() {
+        let reactor = Reactor::get();
+        let mut reactor_lock = reactor.lock();
+
+        let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let source = reactor
+            .insert_io(unsafe { Registration::new(stream.as_fd()) })
+            .unwrap();
+
+        let mut event = Event::none(source.key);
+        event.readable = true;
+        event.writable = true;
+        source.registration.modify(&reactor.poller, event).unwrap();
+
+        let order = Arc::new(Mutex::new(Vec::new()));
+        {
+            let mut state = source.state.lock().unwrap();
+            state[READ].waker = Some(recording_waker("read-1", order.clone()));
+            state[READ]
+                .wakers
+                .insert(Some(recording_waker("read-2", order.clone())));
+            state[WRITE].waker = Some(recording_waker("write-1", order.clone()));
+            state[WRITE]
+                .wakers
+                .insert(Some(recording_waker("write-2", order.clone())));
+        }
+
+        peer.write_all(b"ready").unwrap();
+        reactor_lock.react(Some(Duration::from_secs(1))).unwrap();
+
+        assert_eq!(
+            &*order.lock().unwrap(),
+            &["read-1", "read-2", "write-1", "write-2"],
+            "write readiness crossed the read readiness boundary"
+        );
+
+        reactor.remove_io(&source).unwrap();
     }
 }
