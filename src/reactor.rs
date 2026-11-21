@@ -46,6 +46,13 @@ const TIMER_QUEUE_SIZE: usize = 1000;
 #[cfg(target_os = "espidf")]
 const TIMER_QUEUE_SIZE: usize = 100;
 
+/// Maximum number of expired timers to wake in one reactor turn.
+///
+/// Ready timers share the same wakeup queue as I/O events. Waking an unbounded number of timers
+/// at once can put I/O events behind the whole timer batch and delay network callbacks. Keep the
+/// batch small so that I/O is polled and dispatched regularly while a timer backlog drains.
+const TIMER_BATCH_SIZE: usize = 128;
+
 const READ: usize = 0;
 const WRITE: usize = 1;
 
@@ -215,8 +222,15 @@ impl Reactor {
         // Split timers into ready and pending timers.
         //
         // Careful to split just *after* `now`, so that a timer set for exactly `now` is considered
-        // ready.
-        let pending = timers.split_off(&(now + Duration::from_nanos(1), 0));
+        // ready. Leave the rest of the expired timers in the map so that only a bounded batch is
+        // woken in this reactor turn.
+        let ready_cutoff = (now + Duration::from_nanos(1), 0);
+        let split_at = timers
+            .range(..ready_cutoff)
+            .nth(TIMER_BATCH_SIZE)
+            .map(|(&key, _)| key)
+            .unwrap_or(ready_cutoff);
+        let pending = timers.split_off(&split_at);
         let ready = mem::replace(&mut *timers, pending);
 
         // Calculate the duration until the next event.
@@ -277,10 +291,11 @@ impl ReactorLock<'_> {
         #[cfg(feature = "tracing")]
         let _enter = span.enter();
 
+        let mut timer_wakers = Vec::new();
         let mut wakers = Vec::new();
 
         // Process ready timers.
-        let next_timer = self.reactor.process_timers(&mut wakers);
+        let next_timer = self.reactor.process_timers(&mut timer_wakers);
 
         // compute the timeout for blocking on I/O events.
         let timeout = match (next_timer, timeout) {
@@ -304,7 +319,7 @@ impl ReactorLock<'_> {
             Ok(0) => {
                 if timeout != Some(Duration::from_secs(0)) {
                     // The non-zero timeout was hit so fire ready timers.
-                    self.reactor.process_timers(&mut wakers);
+                    self.reactor.process_timers(&mut timer_wakers);
                 }
                 Ok(())
             }
@@ -355,7 +370,10 @@ impl ReactorLock<'_> {
             Err(err) => Err(err),
         };
 
-        // Wake up ready tasks.
+        // Wake up ready tasks. I/O wakers go first because timers are allowed to make up an
+        // arbitrarily large backlog; putting a batch of timers ahead of I/O would delay network
+        // callbacks that are already ready.
+        wakers.extend(timer_wakers);
         #[cfg(feature = "tracing")]
         tracing::trace!("{} ready wakers", wakers.len());
         for waker in wakers {
@@ -676,5 +694,107 @@ impl<H: Borrow<crate::Async<T>>, T> Drop for Ready<H, T> {
                 wakers.remove(key);
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::unix::io::AsFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::Mutex;
+    use std::task::Wake;
+
+    #[derive(Debug)]
+    struct RecordingWaker {
+        name: &'static str,
+        order: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Wake for RecordingWaker {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.order.lock().unwrap().push(self.name);
+        }
+    }
+
+    fn recording_waker(name: &'static str, order: Arc<Mutex<Vec<&'static str>>>) -> Waker {
+        Waker::from(Arc::new(RecordingWaker { name, order }))
+    }
+
+    fn test_reactor() -> Reactor {
+        Reactor {
+            poller: Poller::new().unwrap(),
+            ticker: AtomicUsize::new(0),
+            sources: Mutex::new(Slab::new()),
+            events: Mutex::new(Events::new()),
+            timers: Mutex::new(BTreeMap::new()),
+            timer_ops: ConcurrentQueue::bounded(TIMER_QUEUE_SIZE),
+        }
+    }
+
+    #[test]
+    fn timers_do_not_starve_io() {
+        let reactor = test_reactor();
+
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        let source = reactor
+            .insert_io(unsafe { Registration::new(server.as_fd()) })
+            .unwrap();
+
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let io_waker = recording_waker("io", order.clone());
+        source.state.lock().unwrap()[READ].waker = Some(io_waker);
+
+        let mut event = Event::none(source.key);
+        event.readable = true;
+        source.registration.modify(&reactor.poller, event).unwrap();
+
+        // Make the I/O event ready at the same time as the timer burst.
+        client.write_all(b"ready").unwrap();
+
+        let timer_waker = recording_waker("timer", order.clone());
+        let ready_timers = TIMER_BATCH_SIZE * 2;
+        let when = Instant::now();
+        {
+            let mut timers = reactor.timers.lock().unwrap();
+            for id in 0..ready_timers {
+                timers.insert((when, id), timer_waker.clone());
+            }
+        }
+
+        // Timer wakers are collected before polling, but I/O must be dispatched first and the
+        // timer batch must remain bounded.
+        reactor.lock().react(Some(Duration::from_secs(1))).unwrap();
+
+        {
+            let order = order.lock().unwrap();
+            assert_eq!(order.first(), Some(&"io"));
+            assert_eq!(
+                order.iter().filter(|name| **name == "timer").count(),
+                TIMER_BATCH_SIZE
+            );
+        }
+
+        // Clear the I/O readiness before draining the rest of the timer backlog.
+        let mut buf = [0; 5];
+        server.read_exact(&mut buf).unwrap();
+        while !reactor.timers.lock().unwrap().is_empty() {
+            reactor.lock().react(Some(Duration::ZERO)).unwrap();
+        }
+
+        assert_eq!(
+            order
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|name| **name == "timer")
+                .count(),
+            ready_timers
+        );
     }
 }
